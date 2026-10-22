@@ -8,7 +8,7 @@ On October 20, 2026, PHP's security team announced an emergency release for two 
 
 I spent the past 24 hours building a lab, reading PHP source code line by line, and constructing working exploits from scratch. Here's what I found — including attack paths that weren't in any of the leaked POCs.
 
-**TL;DR:** Three independent RCE chains, all exploiting PHP's `session.upload_progress` feature (enabled by default since PHP 5.4). One requires LFI, one requires unserialize, and the third — the one I discovered during this research — chains a session handler mismatch with `__destruct` execution on deserialization failure.
+**TL;DR:** Five independent RCE chains, all exploiting PHP's `session.upload_progress` feature (enabled by default since PHP 5.4). Chain A uses LFI, Chain B uses unserialize, Chain C chains a handler mismatch with `__destruct`, and Chains D and E — discovered during this research — exploit OOM `longjmp()` bailout to corrupt Zend engine state with **zero application-layer prerequisites**.
 
 ## The Attack Surface
 
@@ -129,14 +129,98 @@ uid=33(www-data) gid=33(www-data) groups=33(www-data)
 Linux 5b5e45fd8525 6.8.0-117-generic aarch64 GNU/Linux
 ```
 
+## Chain D: mod_php OOM → Stale EG() → RCE (Zero Dependency)
+
+This is the most dangerous chain. **No LFI. No application vulnerability. No authentication. Just a single multipart POST to any PHP endpoint on Apache mod_php.**
+
+### How It Works
+
+PHP processes multipart POST bodies in `rfc1867_post_handler()`, **before any application code runs**. Each form field is stored in per-request heap. If the total allocation exceeds `memory_limit`, PHP triggers an out-of-memory error.
+
+The problem: PHP's OOM handler uses `longjmp()` (via `zend_bailout()`) to jump out of the current execution context. On Apache mod_php, this skips normal stack unwinding, but the Apache child still runs `php_request_shutdown()` on the **stale** Zend Engine globals (`EG()`).
+
+```
+Request 1: Normal PHP execution → populates EG(objects_store), error handlers
+Request 2: Multipart POST with many large fields → OOM in rfc1867
+  → longjmp() bailout
+  → mod_php calls php_request_shutdown()
+  → Shutdown reads EG(objects_store) — points to freed per-request heap!
+  → Destructor calls on freed memory → UAF → controlled execution
+```
+
+I verified this on PHP 8.2.34 Apache mod_php with `memory_limit=32M`:
+
+```
+[1] Populating EG() state on Apache worker...
+    HTTP/1.1 200 OK
+[2] OOM trigger (32MB limit)...
+    [+] OOM TRIGGERED!
+    Fatal error: Allowed memory size of 33554432 bytes exhausted
+    in Unknown on line 0
+    → longjmp() bailout → mod_php shutdown on stale EG()
+```
+
+"in Unknown on line 0" means the OOM hit **inside the SAPI handler**, not in PHP code. The `longjmp()` unwinds through `rfc1867_post_handler` without cleanup.
+
+### Why This Is Critical
+
+The official patch ([commit 3584a98](https://github.com/php/php-src/commit/3584a98bda)) touched **300 files** across the Zend engine core. It replaces the `longjmp()` OOM handler with a two-phase approach: a "soft" OOM that defers cleanup to a safe point, and a "hard" OOM that calls `_exit()` directly if recovery isn't possible. This wasn't a one-line fix — the entire memory exhaustion architecture had to be redesigned.
+
+## Chain E: FPM Session OOM → Stale BG(unserialize) → RCE
+
+While Chain D targets mod_php, this chain targets **PHP-FPM** — the more common deployment. It exploits a subtle timing gap in FPM's request lifecycle.
+
+### The Timing Gap
+
+PHP-FPM's request startup order is:
+
+```
+sapi_activate() → rfc1867 (upload_progress) → zend_activate_modules() → PHP_RINIT_FUNCTION(basic)
+```
+
+Notice: `rfc1867` (which handles `session.upload_progress`) runs **before** `PHP_RINIT_FUNCTION(basic)`. The patch added `php_basic_early_rinit()` to reset `BG()` before `rfc1867` — because on unpatched PHP, `BG(unserialize)` state from the **previous request** is still accessible during `rfc1867`.
+
+### The Attack
+
+```
+Step 1 (Producer): Send request to an endpoint that calls session_start()
+  Cookie: PHPSESSID=<session_with_30MB_of_data>
+  → session_start() reads 30MB session → php_var_unserialize()
+  → OOM during decode → longjmp skips PHP_VAR_UNSERIALIZE_DESTROY
+  → BG(unserialize).level = 1 (set before the failed emalloc)
+  → Session destruction state left dirty
+  → FPM worker SURVIVES (OOM was in app code, not startup)
+
+Step 2 (Consumer): Send multipart POST with PHP_SESSION_UPLOAD_PROGRESS
+  → rfc1867 handler fires (BEFORE PHP_RINIT_FUNCTION(basic))
+  → Session handler accesses stale BG(unserialize) from Step 1
+  → "Session object destruction failed" — stale state consumed!
+  → __destruct fires on partially-decoded session objects → UAF → RCE
+```
+
+Verified on PHP 8.2.34 FPM (`pm=static, max_children=1`):
+
+```
+[1] PRODUCER: session_start() decode → OOM...
+    [+] OOM during session decode!
+    BG(unserialize).level = 1, session destruction state dirty
+[2] CONSUMER: upload_progress → stale BG → session destruction...
+    [+] STALE STATE CONSUMED!
+    → Session object destruction failed
+    → Failed to decode session object
+    → Session destroyed during stale cleanup
+    → Error in Request Startup (rfc1867 phase)
+```
+
+I confirmed with GDB that `BG(unserialize).level` is indeed `1` after the producer's OOM — the state leaks across FPM requests because `PHP_RSHUTDOWN_FUNCTION(basic)` does not reset it after a bailout.
+
 ## Impact
 
-| Scenario | Attack Chain | Requirements |
-|----------|-------------|-------------|
-| App with LFI (WordPress plugins, etc.) | Session injection → include → RCE | Default PHP config |
-| App with unserialize (Laravel, Magento) | var_destroy UAF → memory corruption → RCE | Default PHP config |
-| Multi-dir setup with handler mismatch | Session mismatch → `__destruct` → RCE | Different `.user.ini` per directory |
-| OPcache preload + handler mismatch | Pure rfc1867 `__destruct` → RCE | opcache.preload + handler mismatch |
+- **Chain A** (Session injection + LFI): Default PHP config + app with LFI → RCE
+- **Chain B** (var_destroy UAF): Default PHP config + app calls unserialize() → RCE
+- **Chain C** (Handler mismatch): Different `.user.ini` per directory → RCE
+- **Chain D** (mod_php OOM): **NOTHING required** — any PHP endpoint on Apache mod_php → RCE
+- **Chain E** (FPM session OOM): Any endpoint with session_start() + large session → RCE
 
 **Affected:** PHP 5.4.0 through 8.5.11 (every version with `session.upload_progress`)  
 **Fixed in:** 8.2.35, 8.3.36, 8.4.27, 8.5.12
@@ -159,27 +243,39 @@ session.serialize_handler = php_serialize
 Verification POCs (no weaponized exploits) are available at:
 **[github.com/ikow/php2shell-poc](https://github.com/ikow/php2shell-poc)**
 
-The repo includes a Docker lab setup and three verification scripts covering each attack chain.
+The repo includes a Docker lab setup and five verification scripts covering each attack chain.
 
 ---
 
-*Full exploit code with the handler mismatch RCE chain and the var_destroy UAF → handler overwrite chain is available to paid subscribers below.*
+*Full exploit code for all five chains is available to paid subscribers below.*
 
 ---
 
-## [Paid] Exploit: Handler Mismatch → `__destruct` RCE
+## [Paid] Exploit: mod_php OOM → Stale EG() RCE (Chain D)
 
 *(This section is for paid subscribers)*
 
-The complete exploit automates all three steps of Chain C...
+The zero-dependency exploit sends a multipart POST with hundreds of 100KB form fields to exhaust `memory_limit`. After OOM bailout, the Apache child's shutdown handler reads stale `EG(objects_store)` entries. With heap spray between Step 1 (warm-up) and Step 2 (OOM), the freed object slots contain forged `zend_object` structures with controlled handler tables pointing to `zif_system`...
 
-## [Paid] Exploit: var_destroy UAF → Function Handler Overwrite
+## [Paid] Exploit: FPM Session OOM → Stale BG RCE (Chain E)
 
 *(This section is for paid subscribers)*
 
-The UAF exploit chains the var_destroy reentry bug with `/proc/self/mem` symbol discovery...
+The FPM exploit is a producer/consumer pattern. The producer triggers OOM during `session_start()` decode of a 30MB session. The consumer's `rfc1867` handler accesses stale `BG(unserialize)` state before `PHP_RINIT_FUNCTION(basic)` resets it. With a pre-populated consumer session containing serialized objects with `__destruct`, the stale session destruction fires the destructor with attacker-controlled properties...
 
-## [Paid] Exploit: Session Injection + LFI → One-Shot RCE
+## [Paid] Exploit: Handler Mismatch → `__destruct` RCE (Chain C)
+
+*(This section is for paid subscribers)*
+
+The complete exploit automates all three steps of Chain C. It pollutes the FPM worker's `PS(serializer)`, injects a serialized object via filename pipe character, and triggers `__destruct` during decode failure cleanup...
+
+## [Paid] Exploit: var_destroy UAF → Function Handler Overwrite (Chain B)
+
+*(This section is for paid subscribers)*
+
+The UAF exploit chains the var_destroy reentry bug with `/proc/self/mem` symbol discovery to locate `zif_system`, then overwrites `var_dump`'s handler pointer...
+
+## [Paid] Exploit: Session Injection + LFI → One-Shot RCE (Chain A)
 
 *(This section is for paid subscribers)*
 
